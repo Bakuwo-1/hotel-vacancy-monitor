@@ -9,7 +9,7 @@ on:
         type: boolean
         default: false
 permissions:
-  contents: read
+  contents: write
   actions: write
 concurrency:
   group: availability-monitor
@@ -150,6 +150,33 @@ jobs:
                       sent += 1
               except Exception:
                   failed += 1
+          # A harmless monthly marker keeps active monitors from becoming stale.
+          try:
+              import base64
+              marker_url = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/contents/.monitor-activity'
+              headers = {'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'}
+              marker = {}
+              try:
+                  with req.urlopen(req.Request(marker_url, headers=headers), timeout=10) as response:
+                      marker = json.load(response)
+              except Exception as exc:
+                  if getattr(exc, 'code', None) != 404:
+                      raise
+              month = today.strftime('%Y-%m')
+              old_content = base64.b64decode(marker.get('content', '')).decode().strip()
+              if old_content != month:
+                  payload = {'message': 'Update monitor maintenance marker', 'content': base64.b64encode(month.encode()).decode()}
+                  if marker.get('sha'):
+                      payload['sha'] = marker['sha']
+                  request = req.Request(marker_url, data=json.dumps(payload).encode(), headers=dict(headers, **{'Content-Type': 'application/json'}), method='PUT')
+                  with req.urlopen(request, timeout=10) as response:
+                      json.load(response)
+                  print('Maintenance marker updated.')
+              else:
+                  print('Maintenance marker is current.')
+          except Exception:
+              failed += 1
+              print('Maintenance update failed; private details suppressed.')
           report = '# Availability monitor' + chr(10) + 'Private configuration is not displayed.' + chr(10) + f'Checks completed: {completed}; available: {found}; notifications accepted: {sent}; errors: {failed}; test notification accepted: {tested}'
           print(report)
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as output:
