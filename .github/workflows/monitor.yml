@@ -1,0 +1,158 @@
+name: Availability monitor
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch:
+    inputs:
+      test_notification:
+        description: 'Send a test notification'
+        type: boolean
+        default: false
+permissions:
+  contents: read
+  actions: write
+concurrency:
+  group: availability-monitor
+  cancel-in-progress: false
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    env:
+      WATCH_CONFIG: ${{ secrets.WATCH_CONFIG }}
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+      TEST_NOTIFICATION: ${{ inputs.test_notification }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check availability without logging private configuration
+        shell: python
+        run: |
+          import datetime as dt
+          import json, os, re, sys
+          import urllib.request as req
+          from urllib.parse import urlsplit
+          from zoneinfo import ZoneInfo
+
+          def safe_url(url):
+              parts = urlsplit(url)
+              if parts.scheme != 'https' or parts.hostname not in {'d-reserve.jp', 'www.489pro-x.com'} or parts.username or parts.password:
+                  raise ValueError('Unsupported service URL')
+              return url
+
+          def fetch_json(url):
+              request = req.Request(safe_url(url), headers={'Accept': 'application/json', 'User-Agent': 'AvailabilityMonitor/1.0'})
+              with req.urlopen(request, timeout=15) as response:
+                  return json.load(response)
+
+          def available(data, check):
+              if not isinstance(data, dict):
+                  raise ValueError('Unexpected response type')
+              if check['kind'] == 'plans_v1':
+                  plans, count = data.get('planDetailResources'), data.get('resultCount')
+                  if not isinstance(plans, list) or type(count) is not int or count < 0 or ((count == 0) != (len(plans) == 0)):
+                      raise ValueError('Unexpected plan response')
+                  if count == 0:
+                      return False
+                  rooms = [r for p in plans for r in p.get('roomSearchResults', []) if r.get('roomSearchResults') and r.get('planPrice')]
+                  if not rooms:
+                      raise ValueError('Plans without bookable room prices')
+                  return True
+              if check['kind'] == 'calendar_v1':
+                  if data.get('result') is not True:
+                      raise ValueError('Calendar request failed')
+                  date_key = dt.date.fromisoformat(check['date']).strftime('%Y%m%d')
+                  entry = data['data'][date_key[:6]][str(int(date_key[6:]))]
+                  if entry.get('date') != date_key or 'price' not in entry:
+                      raise ValueError('Unexpected calendar entry')
+                  price = entry['price']
+                  if price is None:
+                      return False
+                  if type(price) not in (int, float) or price <= 0:
+                      raise ValueError('Unexpected calendar price')
+                  return True
+              raise ValueError('Unsupported detector')
+
+          # Small regression checks cover sold-out, available, and malformed data.
+          assert available({'resultCount': 0, 'planDetailResources': []}, {'kind': 'plans_v1'}) is False
+          assert available({'resultCount': 1, 'planDetailResources': [{'roomSearchResults': [{'planPrice': '1', 'roomSearchResults': [{}]}]}]}, {'kind': 'plans_v1'}) is True
+          sample = {'kind': 'calendar_v1', 'date': '2099-01-01'}
+          def sample_calendar(price):
+              return {'result': True, 'data': {'209901': {'1': {'date': '20990101', 'price': price}}}}
+          assert available(sample_calendar(None), sample) is False
+          assert available(sample_calendar(1), sample) is True
+          for invalid in ({}, {'resultCount': 1, 'planDetailResources': []}, {'resultCount': 1, 'planDetailResources': [{}]}):
+              try:
+                  available(invalid, {'kind': 'plans_v1'})
+              except (ValueError, KeyError, TypeError):
+                  pass
+              else:
+                  raise AssertionError('Malformed response must not be considered sold out')
+          print('Detector regression checks passed.')
+
+          raw = os.environ.get('WATCH_CONFIG', '')
+          topic = os.environ.get('NTFY_TOPIC', '')
+          if not raw or not topic:
+              print('Private configuration has not been set; skipped.')
+              sys.exit(0)
+          try:
+              checks = json.loads(raw)['checks']
+              if not isinstance(checks, list) or not checks:
+                  raise ValueError()
+              dates = [dt.date.fromisoformat(c['date']) for c in checks]
+              if not re.fullmatch(r'[A-Za-z0-9_-]{24,100}', topic):
+                  raise ValueError()
+              for check in checks:
+                  safe_url(check['api_url'])
+                  safe_url(check['booking_url'])
+                  if check['kind'] not in {'plans_v1', 'calendar_v1'}:
+                      raise ValueError()
+          except Exception:
+              raise RuntimeError('Invalid private configuration; contents suppressed.') from None
+
+          def notify(title, message, link=None):
+              payload = {'topic': topic, 'title': title, 'message': message, 'priority': 4}
+              if link:
+                  payload['click'] = safe_url(link)
+              request = req.Request('https://ntfy.sh', data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json'}, method='POST')
+              with req.urlopen(request, timeout=10) as response:
+                  if not json.load(response).get('id'):
+                      raise ValueError('Delivery not acknowledged')
+
+          today = dt.datetime.now(ZoneInfo('Asia/Tokyo')).date()
+          if today > max(dates):
+              try:
+                  url = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/actions/workflows/monitor.yml/disable'
+                  request = req.Request(url, data=b'', headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'}, method='PUT')
+                  with req.urlopen(request, timeout=10) as response:
+                      print('Monitoring period ended; workflow disabled.')
+              except Exception:
+                  raise RuntimeError('Unable to disable expired workflow.') from None
+              sys.exit(0)
+
+          tested = False
+          if os.environ.get('TEST_NOTIFICATION', '').lower() == 'true':
+              try:
+                  notify('ホテル空室監視：15分間隔の通知テスト', '公開コード版への移行テストです。空室の通知ではありません。')
+                  tested = True
+              except Exception:
+                  raise RuntimeError('Test notification failed; private details suppressed.') from None
+
+          completed, found, sent, failed = 0, 0, 0, 0
+          for check, date in zip(checks, dates):
+              if date < today:
+                  continue
+              try:
+                  result = available(fetch_json(check['api_url']), check)
+                  completed += 1
+                  if result:
+                      found += 1
+                      notify(check['title'], check['message'], check['booking_url'])
+                      sent += 1
+              except Exception:
+                  failed += 1
+          report = '# Availability monitor' + chr(10) + 'Private configuration is not displayed.' + chr(10) + f'Checks completed: {completed}; available: {found}; notifications accepted: {sent}; errors: {failed}; test notification accepted: {tested}'
+          print(report)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as output:
+              output.write(report)
+          if failed:
+              raise RuntimeError('One or more checks failed. Private details suppressed.') from None
